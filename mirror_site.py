@@ -3,7 +3,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse, parse_qs, urlunparse
+
 import os
 import time
 import requests
@@ -22,20 +23,29 @@ class ForumMirror:
         self.forum_sections = set()  # Track forum section numbers
         self.topics = set()  # Track topic numbers
         self.login_config = login_config
+        os.makedirs(self.output_dir, exist_ok=True)  # Ensure output directory exists
         self.setup_logging()
         self.setup_driver()
-    
+        # Create the file for storing visited URLs
+        self.visited_urls_file = os.path.join(self.output_dir, "visited_urls.txt")
+        with open(self.visited_urls_file, 'w') as f:
+            f.write("Visited URLs:\n")
+
+    def save_url_to_file(self, url):
+        """Save each visited URL to a file."""
+        with open(self.visited_urls_file, 'a') as f:
+            f.write(url + '\n')
 
     def setup_logging(self):
         logging.basicConfig(
             filename='forum_mirror.log',
-            level=logging.INFO,
+            level=logging.DEBUG,  # Set to DEBUG level for detailed output
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
 
     def setup_driver(self):
         chrome_options = Options()
-        # chrome_options.add_argument('--headless')  # Commented out for debugging
+        # chrome_options.add_argument('--headless')  # Uncomment for headless mode
         chrome_options.add_argument('--disable-gpu')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
@@ -94,29 +104,14 @@ class ForumMirror:
             return False
 
     def check_login_success(self):
+        # TODO: Implement actual check for successful login, such as verifying a specific element's presence
         return True
-        try:
-            if 'success_indicator' in self.login_config:
-                indicator = self.login_config['success_indicator']
-                if indicator.get('type') == 'element':
-                    element = WebDriverWait(self.driver, indicator.get('timeout', 10)).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, indicator['selector']))
-                    )
-                    if indicator.get('text_contains'):
-                        return indicator['text_contains'] in element.text
-                    return True
-            return False
-        except Exception as e:
-            logging.error(f"Login check failed: {str(e)}")
-            return False
 
     def is_forum_section_link(self, url):
         """Check if URL is a forum section link"""
         parsed = urlparse(url)
         if parsed.path.endswith('viewforum.php'):
             params = parse_qs(parsed.query)
-            print("what is params?")
-            print(params)
             return 'f' in params
         return False
 
@@ -126,31 +121,11 @@ class ForumMirror:
         params = parse_qs(parsed.query)
         return params.get('f', [None])[0]
 
-    def create_directory_structure(self, url):
-        """Create appropriate directory structure for saving files"""
-        parsed = urlparse(url)
-        params = parse_qs(parsed.query)
-        
-        if parsed.path.endswith('viewforum.php') and 'f' in params:
-            # For forum sections
-            section_num = params['f'][0]
-            path = f'forum/section_{section_num}/index.html'
-        else:
-            # For other pages
-            path = parsed.path.lstrip('/')
-            if not path:
-                path = 'index.html'
-            elif not path.endswith('.html'):
-                path = os.path.join(path, 'index.html')
-
-        full_path = os.path.join(self.output_dir, path)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        return full_path
     def is_topic_link(self, url):
         """Check if URL is a topic link"""
         parsed = urlparse(url)
         return parsed.path.endswith('viewtopic.php') and 't' in parse_qs(parsed.query)
-    
+
     def normalize_url(self, url):
         """
         Normalize a URL to avoid duplicates by:
@@ -191,8 +166,6 @@ class ForumMirror:
             
             # Reconstruct query string with sorted parameters
             query = '&'.join(f"{k}={v}" for k, v in sorted(important_params.items()))
-            print("what is this reconstructed query???")
-            print(query)
             # Reconstruct the URL
             normalized = urlunparse((
                 parsed.scheme,
@@ -202,8 +175,7 @@ class ForumMirror:
                 query,
                 ''
             ))
-            print("normalized url is ???")
-            print(normalized) 
+            logging.debug(f"Normalized URL: {normalized}")
             return normalized
         
         except Exception as e:
@@ -253,6 +225,7 @@ class ForumMirror:
             return []
 
         self.visited_urls.add(url)
+        self.save_url_to_file(url)  # Save the URL to file
         logging.info(f"Mirroring page: {url}")
 
         try:
@@ -279,8 +252,6 @@ class ForumMirror:
                 if href.startswith('./'):
                     href = href[2:]  # Remove leading ./
                 full_url = urljoin(url, href)
-                print("what is full url??")
-                print(full_url) 
                 if self.is_forum_section_link(full_url):
                     section_num = self.get_section_number(full_url)
                     if section_num and section_num not in self.forum_sections:
@@ -292,7 +263,6 @@ class ForumMirror:
         except Exception as e:
             logging.error(f"Failed to mirror {url}: {str(e)}")
             return []
-
 
     def get_topic_number(self, url):
         """Extract topic number from URL"""
@@ -327,10 +297,8 @@ class ForumMirror:
     def get_pagination_urls(self, soup, current_url):
         """Extract pagination URLs from the page"""
         pagination_urls = set()
-        parsed = urlparse(current_url)
         
-        # Find pagination links
-        for link in soup.find_all('a', class_='pagination'):
+        for link in soup.find('ul', class_='pagination').find_all('a'):
             href = link.get('href')
             if href:
                 full_url = urljoin(current_url, href)
@@ -447,6 +415,7 @@ class ForumMirror:
                 else:
                     new_urls = self.mirror_page(url)
                 
+                # Ensure new URLs are not already visited
                 urls_to_visit.extend([u for u in new_urls if u not in self.visited_urls])
                 logging.info(f"Queue size: {len(urls_to_visit)}, Visited: {len(self.visited_urls)}")
 
@@ -461,7 +430,7 @@ if __name__ == "__main__":
     with open('login_config.json', 'r') as f:
         login_config = json.load(f)
 
-    base_url = login_config['base_url']
+    base_url = login_config['base_url'] 
     output_directory = "mirrored_forum"
     
     mirror = ForumMirror(base_url, output_directory, login_config=login_config)
