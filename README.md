@@ -1,6 +1,6 @@
-# Forum Mirror
+# phpBB Forum Mirrorer
 
-Forum Mirror is a Python tool that downloads and locally mirrors entire online forums, including forum sections, topics, and pages. This tool uses Selenium to interact with pages that may require login and dynamically load content, making it versatile for mirroring interactive forums.
+phpBB Forum Mirrorer is a Python tool that downloads and locally mirrors entire online forums, including forum sections, topics, and pages. This tool uses Selenium to interact with pages that may require login and dynamically load content, making it versatile for mirroring interactive forums.
 
 ## Features
 
