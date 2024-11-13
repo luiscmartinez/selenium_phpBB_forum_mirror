@@ -104,8 +104,13 @@ class ForumMirror:
             return False
 
     def check_login_success(self):
-        # TODO: Implement actual check for successful login, such as verifying a specific element's presence
-        return True
+        print("Checking login success status")
+        if self.login_config["username"] in self.driver.page_source:
+            print("Login successful!")
+            return True
+        else:
+            print("Login failed!")
+            return False
 
     def is_forum_section_link(self, url):
         """Check if URL is a forum section link"""
