@@ -20,16 +20,13 @@ class ForumMirror:
         self.domain = urlparse(base_url).netloc
         self.output_dir = output_dir
         self.visited_urls = set()
-        self.forum_sections = set()  # Track forum section numbers
-        self.topics = set()  # Track topic numbers
+        self.forum_sections = set()
+        self.topics = set()
         self.login_config = login_config
-        os.makedirs(self.output_dir, exist_ok=True)  # Ensure output directory exists
+        os.makedirs(self.output_dir, exist_ok=True)
         self.setup_logging()
         self.setup_driver()
-        # Create the file for storing visited URLs
         self.visited_urls_file = os.path.join(self.output_dir, "visited_urls.txt")
-        with open(self.visited_urls_file, 'w') as f:
-            f.write("Visited URLs:\n")
 
     def save_url_to_file(self, url):
         """Save each visited URL to a file."""
@@ -62,22 +59,6 @@ class ForumMirror:
             logging.info("Navigating to login page")
             time.sleep(3)
 
-            # Check for existing cookies
-            if os.path.exists('cookies.pkl'):
-                cookies = pickle.load(open('cookies.pkl', 'rb'))
-                for cookie in cookies:
-                    try:
-                        self.driver.add_cookie(cookie)
-                    except Exception as e:
-                        logging.error(f"Error loading cookie: {str(e)}")
-                self.driver.refresh()
-                time.sleep(3)
-                
-                if self.check_login_success():
-                    logging.info("Successfully logged in using cookies")
-                    return True
-
-            # Perform login
             username_field = WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, self.login_config['username_selector']))
             )
@@ -104,8 +85,7 @@ class ForumMirror:
             return False
 
     def check_login_success(self):
-        print("Checking login success status")
-        if self.login_config["username"] in self.driver.page_source:
+        if self.login_config["username"] in self.driver.page_source:  
             print("Login successful!")
             return True
         else:
@@ -127,7 +107,6 @@ class ForumMirror:
         return params.get('f', [None])[0]
 
     def is_topic_link(self, url):
-        """Check if URL is a topic link"""
         parsed = urlparse(url)
         return parsed.path.endswith('viewtopic.php') and 't' in parse_qs(parsed.query)
 
@@ -143,13 +122,11 @@ class ForumMirror:
         try:
             # Parse the URL
             parsed = urlparse(url)
-            
             # Handle relative URLs
             if not parsed.netloc:
                 url = urljoin(self.base_url, url)
                 parsed = urlparse(url)
             
-            # Get the query parameters
             params = parse_qs(parsed.query)
             
             # Keep only necessary parameters
@@ -159,7 +136,6 @@ class ForumMirror:
             if self.is_forum_section_link(url):
                 if 'f' in params:
                     important_params['f'] = params['f'][0]
-            
             # For topics, keep 'f', 't', and 'start'
             elif self.is_topic_link(url):
                 if 'f' in params:
@@ -169,9 +145,7 @@ class ForumMirror:
                 if 'start' in params:
                     important_params['start'] = params['start'][0]
             
-            # Reconstruct query string with sorted parameters
             query = '&'.join(f"{k}={v}" for k, v in sorted(important_params.items()))
-            # Reconstruct the URL
             normalized = urlunparse((
                 parsed.scheme,
                 parsed.netloc.lower(),
@@ -230,7 +204,7 @@ class ForumMirror:
             return []
 
         self.visited_urls.add(url)
-        self.save_url_to_file(url)  # Save the URL to file
+        self.save_url_to_file(url)
         logging.info(f"Mirroring page: {url}")
 
         try:
@@ -245,7 +219,6 @@ class ForumMirror:
             
             output_file = self.create_directory_structure(url)
             self.download_assets(soup, self.output_dir)
-            
             # Save the HTML
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(str(soup))
@@ -255,7 +228,7 @@ class ForumMirror:
             for a in soup.find_all('a', href=True):
                 href = a['href']
                 if href.startswith('./'):
-                    href = href[2:]  # Remove leading ./
+                    href = href[2:]
                 full_url = urljoin(url, href)
                 if self.is_forum_section_link(full_url):
                     section_num = self.get_section_number(full_url)
@@ -300,7 +273,6 @@ class ForumMirror:
         return full_path
 
     def get_pagination_urls(self, soup, current_url):
-        """Extract pagination URLs from the page"""
         pagination_urls = set()
         
         for link in soup.find('ul', class_='pagination').find_all('a'):
@@ -329,7 +301,6 @@ class ForumMirror:
             html_content = self.driver.page_source
             soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Save the current page
             output_file = self.create_directory_structure(topic_url)
             self.download_assets(soup, self.output_dir)
             
@@ -338,7 +309,6 @@ class ForumMirror:
             
             self.visited_urls.add(topic_url)
             
-            # Get pagination URLs
             pagination_urls = self.get_pagination_urls(soup, topic_url)
             new_urls.extend(pagination_urls)
             
