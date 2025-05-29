@@ -374,6 +374,26 @@ class ForumMirror:
                 logging.error("Failed to login. Aborting mirror process.")
                 return
 
+            # Check for locked category after login
+            try:
+                # Wait a short time for the page to load
+                time.sleep(2)
+                if len(self.driver.find_elements(By.ID, "login_forum")) > 0:
+                    logging.info("Locked category detected, attempting to unlock...")
+                    password = self.login_config.get("forum_password")
+                    if not password:
+                        logging.error("No forum password provided in login_config.")
+                        return
+                    password_input = self.driver.find_element(By.ID, "password")
+                    password_input.clear()
+                    password_input.send_keys(password)
+                    submit_btn = self.driver.find_element(By.ID, "load")
+                    submit_btn.click()
+                    time.sleep(3)  # Wait for unlock to process
+                    logging.info("Forum password submitted.")
+            except Exception as e:
+                logging.error(f"Error handling locked category: {str(e)}")
+
             urls_to_visit = [self.base_url]
             sections_processed = 0
 
