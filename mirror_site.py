@@ -23,6 +23,7 @@ class ForumMirror:
         self.forum_sections = set()
         self.topics = set()
         self.login_config = login_config
+        self.start_url = login_config.get("start_url", base_url) if login_config else base_url
         os.makedirs(self.output_dir, exist_ok=True)
         self.setup_logging()
         self.setup_driver()
@@ -318,6 +319,15 @@ class ForumMirror:
             logging.error(f"Failed to mirror topic {topic_url}: {str(e)}")
             return []
 
+    def is_forum_section_link(self, url):
+        """Check if URL is a forum section link"""
+        print(f"Checking if {url} is a forum section link")
+        parsed = urlparse(url)
+        if parsed.path.endswith('viewforum.php'):
+            params = parse_qs(parsed.query)
+            return 'f' in params
+        return False
+
     def mirror_section(self, section_url):
         """Mirror an entire forum section including all topics"""
         if section_url in self.visited_urls:
@@ -369,40 +379,45 @@ class ForumMirror:
             return []
 
     def mirror_forum(self, max_sections=None):
+    def load_cookies(self, cookie_file='cookies.pkl'):
         try:
-            if self.login_config and not self.perform_login():
-                logging.error("Failed to login. Aborting mirror process.")
-                return
+            with open(cookie_file, 'rb') as f:
+                cookies = pickle.load(f)
+            self.driver.get(self.base_url)  # Open base URL before adding cookies
+            for cookie in cookies:
+                # Remove 'sameSite' if present, as it's not accepted by Selenium
+                cookie.pop('sameSite', None)
+                self.driver.add_cookie(cookie)
+            logging.info("Cookies loaded successfully.")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to load cookies: {str(e)}")
+            return False
 
+    def mirror_forum(self, max_sections=None):
+        try:
+            cookies_loaded = False
+            if os.path.exists('cookies.pkl'):
+                cookies_loaded = self.load_cookies('cookies.pkl')
+            if not cookies_loaded:
+                if self.login_config and not self.perform_login():
+                    logging.error("Failed to login. Aborting mirror process.")
+                    return
+
+            self.driver.get_screenshot_as_file("forum_unlock2.png")  # Take a screenshot for debugging
             # Check for locked category after login
-            try:
-                # Wait a short time for the page to load
-                time.sleep(2)
-                if len(self.driver.find_elements(By.ID, "login_forum")) > 0:
-                    logging.info("Locked category detected, attempting to unlock...")
-                    password = self.login_config.get("forum_password")
-                    if not password:
-                        logging.error("No forum password provided in login_config.")
-                        return
-                    password_input = self.driver.find_element(By.ID, "password")
-                    password_input.clear()
-                    password_input.send_keys(password)
-                    submit_btn = self.driver.find_element(By.ID, "load")
-                    submit_btn.click()
-                    time.sleep(3)  # Wait for unlock to process
-                    logging.info("Forum password submitted.")
-            except Exception as e:
-                logging.error(f"Error handling locked category: {str(e)}")
 
-            urls_to_visit = [self.base_url]
+            urls_to_visit = [self.start_url]
             sections_processed = 0
 
             while urls_to_visit:
                 url = urls_to_visit.pop(0)
                 
                 if self.is_forum_section_link(url):
+                    print(f"Processing section: {url}")
                     if max_sections and sections_processed >= max_sections:
                         break
+                    print("sending section url to mirror_section")
                     new_urls = self.mirror_section(url)
                     sections_processed += 1
                 elif self.is_topic_link(url):
@@ -426,6 +441,7 @@ if __name__ == "__main__":
         login_config = json.load(f)
 
     base_url = login_config['base_url'] 
+    base_url = login_config['base_url']
     output_directory = "mirrored_forum"
     
     mirror = ForumMirror(base_url, output_directory, login_config=login_config)
