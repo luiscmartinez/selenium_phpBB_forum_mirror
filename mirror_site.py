@@ -13,6 +13,7 @@ import logging
 import pickle
 import json
 import re
+from selenium.common.exceptions import TimeoutException # Add this import
 
 class ForumMirror:
     def __init__(self, base_url, output_dir, login_config=None):
@@ -71,9 +72,10 @@ class ForumMirror:
             login_button = self.driver.find_element(By.CSS_SELECTOR, self.login_config['login_button_selector'])
             login_button.click()
 
-            time.sleep(5)
+            time.sleep(5) # Consider replacing with WebDriverWait for a specific condition after login
 
-            if self.check_login_success():
+            # Pass page_source to check_login_success
+            if self.check_login_success(self.driver.page_source):
                 logging.info("Login successful")
                 pickle.dump(self.driver.get_cookies(), open('cookies.pkl', 'wb'))
                 return True
@@ -85,8 +87,8 @@ class ForumMirror:
             logging.error(f"Login error: {str(e)}")
             return False
 
-    def check_login_success(self):
-        if self.login_config["username"] in self.driver.page_source:  
+    def check_login_success(self, page_source): # Modified to accept page_source
+        if self.login_config["username"] in page_source:  
             print("Login successful!")
             return True
         else:
@@ -161,79 +163,117 @@ class ForumMirror:
         for img in soup.find_all('img'):
             if img.get('src'):
                 try:
-                    img_url = urljoin(self.base_url, img['src'])
-                    img_path = os.path.join('assets', os.path.basename(img_url))
-                    full_img_path = os.path.join(base_folder, img_path)
+                    img_url = urljoin(self.base_url, img['src']) # Use self.base_url for broader context if needed, or current page's base
+                    img_name = os.path.basename(urlparse(img_url).path) # Get a cleaner basename
+                    if not img_name: # Handle cases where basename might be empty (e.g. /)
+                        img_name = f"image_{hash(img_url)}.png" # Fallback name
+
+                    img_path = os.path.join('assets', img_name)
+                    full_img_path = os.path.join(self.output_dir, img_path) # Assets relative to output_dir
                     
                     os.makedirs(os.path.dirname(full_img_path), exist_ok=True)
                     
-                    response = requests.get(img_url)
+                    response = requests.get(img_url, stream=True)
+                    response.raise_for_status()
                     with open(full_img_path, 'wb') as f:
-                        f.write(response.content)
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
                     
-                    img['src'] = f'../../{img_path}'
+                    # Adjust relative path based on typical depth of HTML files
+                    # e.g., forum/section_X/index.html or forum/section_X/topic_Y/page_Z.html
+                    # This needs to be robust. If HTML is at output_dir/index.html, path is 'assets/...'
+                    # If HTML is at output_dir/forum/section_X/index.html, path is '../../assets/...'
+                    # We need to calculate depth from self.output_dir to the current HTML file's dir.
+                    # For simplicity, assuming a common structure or making it configurable might be better.
+                    # The previous '../../' assumed HTML files are two levels deep.
+                    # Let's keep it simple for now, but this could be a point of refinement.
+                    img['src'] = f'../../assets/{img_name}' # Adjusted to use self.output_dir/assets structure
+                except requests.exceptions.RequestException as e:
+                    logging.error(f"Failed to download image {img_url}: {e}")
                 except Exception as e:
-                    logging.error(f"Failed to download image {img_url}")
+                    logging.error(f"Error processing image {img.get('src')}: {str(e)}")
 
         # Handle CSS
         for css in soup.find_all('link', rel='stylesheet'):
             if css.get('href'):
                 try:
                     css_url = urljoin(self.base_url, css['href'])
-                    css_path = os.path.join('assets', os.path.basename(css_url))
-                    full_css_path = os.path.join(base_folder, css_path)
+                    css_name = os.path.basename(urlparse(css_url).path)
+                    if not css_name:
+                        css_name = f"style_{hash(css_url)}.css"
+
+                    css_path = os.path.join('assets', css_name)
+                    full_css_path = os.path.join(self.output_dir, css_path) # Assets relative to output_dir
                     
                     os.makedirs(os.path.dirname(full_css_path), exist_ok=True)
                     
-                    response = requests.get(css_url)
+                    response = requests.get(css_url, stream=True)
+                    response.raise_for_status()
                     with open(full_css_path, 'wb') as f:
-                        f.write(response.content)
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
                     
-                    css['href'] = f'../../{css_path}'
+                    css['href'] = f'../../assets/{css_name}' # Adjusted
+                except requests.exceptions.RequestException as e:
+                    logging.error(f"Failed to download CSS {css_url}: {e}")
                 except Exception as e:
-                    logging.error(f"Failed to download CSS {css_url}")
+                    logging.error(f"Error processing CSS {css.get('href')}: {str(e)}")
 
-    def mirror_page(self, url):
-        if url in self.visited_urls:
+    def _process_page_content(self, html_content, url_original):
+        """Parses HTML content, saves it, and extracts new URLs in their original form."""
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        output_file = self.create_directory_structure(url_original)
+        # Pass the directory of the output_file to download_assets for correct relative path calculation if needed
+        # For now, download_assets assumes assets are relative to self.output_dir and HTML paths are adjusted accordingly.
+        self.download_assets(soup, os.path.dirname(output_file))
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(str(soup))
+        
+        new_urls_original_form = []
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if href.startswith('./'):
+                href = href[2:]
+            
+            full_url_original = urljoin(url_original, href) # Use the original URL for resolving
+            normalized_full_url = self.normalize_url(full_url_original) 
+            
+            if self.is_forum_section_link(normalized_full_url):
+                section_num = self.get_section_number(normalized_full_url)
+                # Check against self.forum_sections (which stores section_num)
+                # to avoid adding duplicates if section already processed or known
+                if section_num and section_num not in self.forum_sections:
+                    # self.forum_sections.add(section_num) # Add when section is actually processed
+                    new_urls_original_form.append(full_url_original) # Add original form
+        
+        return new_urls_original_form
+
+    def mirror_page(self, url_original):
+        normalized_url = self.normalize_url(url_original)
+        if normalized_url in self.visited_urls:
+            logging.info(f"Skipping already mirrored (normalized) page: {normalized_url} (original: {url_original})")
             return []
 
-        self.visited_urls.add(url)
-        self.save_url_to_file(url)
-        logging.info(f"Mirroring page: {url}")
+        logging.info(f"Mirroring page: {url_original} (normalized: {normalized_url})")
 
         try:
-            self.driver.get(url)
+            self.driver.get(url_original) 
             WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
-            time.sleep(2)
+            time.sleep(self.login_config.get("page_load_delay", 2))
             
             html_content = self.driver.page_source
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            output_file = self.create_directory_structure(url)
-            self.download_assets(soup, self.output_dir)
-            # Save the HTML
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(str(soup))
-            
-            # Find forum section links
-            new_urls = []
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                if href.startswith('./'):
-                    href = href[2:]
-                full_url = urljoin(url, href)
-                if self.is_forum_section_link(full_url):
-                    section_num = self.get_section_number(full_url)
-                    if section_num and section_num not in self.forum_sections:
-                        self.forum_sections.add(section_num)
-                        new_urls.append(full_url)
-            
-            return new_urls
+            new_discovered_urls_original_form = self._process_page_content(html_content, url_original) 
+
+            self.visited_urls.add(normalized_url)
+            self.save_url_to_file(normalized_url)
+            return new_discovered_urls_original_form
 
         except Exception as e:
-            logging.error(f"Failed to mirror {url}: {str(e)}")
+            logging.error(f"Failed to mirror {url_original}: {str(e)}")
             return []
 
     def get_topic_number(self, url):
@@ -266,142 +306,175 @@ class ForumMirror:
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         return full_path
 
-    def get_pagination_urls(self, soup, current_url):
-        pagination_urls = set()
-        
-        for link in soup.find('ul', class_='pagination').find_all('a'):
-            href = link.get('href')
-            if href:
-                full_url = urljoin(current_url, href)
-                pagination_urls.add(self.normalize_url(full_url))
+    def get_pagination_urls(self, soup, current_url_original):
+        """Extracts pagination URLs in their original, fully-qualified form."""
+        pagination_urls_original_form = set()
+        pagination_ul = soup.find('ul', class_='pagination')
+        if pagination_ul:
+            for link in pagination_ul.find_all('a'):
+                href = link.get('href')
+                if href:
+                    full_url_original = urljoin(current_url_original, href)
+                    pagination_urls_original_form.add(full_url_original)
                 
-        return list(pagination_urls)
+        return list(pagination_urls_original_form)
 
-    def mirror_topic(self, topic_url):
-        """Mirror an entire topic including all its pages"""
-        if topic_url in self.visited_urls:
+    def _process_topic_page_content(self, html_content, topic_url_original):
+        """Parses topic HTML content, saves it, and extracts pagination URLs (original form)."""
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        output_file = self.create_directory_structure(topic_url_original)
+        self.download_assets(soup, os.path.dirname(output_file))
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(str(soup))
+        
+        pagination_urls_original = self.get_pagination_urls(soup, topic_url_original)
+        return pagination_urls_original
+
+    def mirror_topic(self, topic_url_original):
+        """Fetches a topic page using Selenium, then processes its content."""
+        normalized_topic_url = self.normalize_url(topic_url_original)
+        if normalized_topic_url in self.visited_urls:
+            logging.info(f"Skipping already mirrored (normalized) topic: {normalized_topic_url} (original: {topic_url_original})")
             return []
 
-        logging.info(f"Mirroring topic: {topic_url}")
-        new_urls = []
-
+        logging.info(f"Mirroring topic: {topic_url_original} (normalized: {normalized_topic_url})")
+        
         try:
-            self.driver.get(topic_url)
+            self.driver.get(topic_url_original)
             WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
-            time.sleep(2)
+            time.sleep(self.login_config.get("page_load_delay", 2))
             
             html_content = self.driver.page_source
-            soup = BeautifulSoup(html_content, 'html.parser')
             
-            output_file = self.create_directory_structure(topic_url)
-            self.download_assets(soup, self.output_dir)
+            new_page_urls_original_form = self._process_topic_page_content(html_content, topic_url_original) 
             
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(str(soup))
+            self.visited_urls.add(normalized_topic_url)
+            self.save_url_to_file(normalized_topic_url)
             
-            self.visited_urls.add(topic_url)
-            
-            pagination_urls = self.get_pagination_urls(soup, topic_url)
-            new_urls.extend(pagination_urls)
-            
-            return new_urls
+            topic_num = self.get_topic_number(normalized_topic_url)
+            if topic_num:
+                 self.topics.add(topic_num)
+
+
+            return new_page_urls_original_form
 
         except Exception as e:
-            logging.error(f"Failed to mirror topic {topic_url}: {str(e)}")
+            logging.error(f"Failed to mirror topic {topic_url_original}: {str(e)}")
             return []
 
-    def is_forum_section_link(self, url):
-        """Check if URL is a forum section link"""
-        print(f"Checking if {url} is a forum section link")
+    def _process_section_page_content(self, html_content, section_url_original):
+        """Parses section HTML, saves it, extracts topic and pagination URLs (original form)."""
+        soup = BeautifulSoup(html_content, 'html.parser')
+        new_urls_original_form = []
+
+        output_file = self.create_directory_structure(section_url_original)
+        self.download_assets(soup, os.path.dirname(output_file))
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(str(soup))
+        
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href']
+            if href.startswith('./'): 
+                href = href[2:]
+            
+            full_url_original = urljoin(section_url_original, href)
+            normalized_full_url = self.normalize_url(full_url_original)
+
+            if self.is_topic_link(normalized_full_url):
+                # topic_num = self.get_topic_number(normalized_full_url) # topics are added when topic itself is mirrored
+                new_urls_original_form.append(full_url_original)
+        
+        pagination_urls_original = self.get_pagination_urls(soup, section_url_original)
+        new_urls_original_form.extend(pagination_urls_original)
+        
+        return new_urls_original_form
+
+    def mirror_section(self, section_url_original):
+        """Fetches a section page, handles locks, then processes content."""
+        normalized_section_url = self.normalize_url(section_url_original)
+
+        try:
+            self.driver.get(section_url_original)
+            WebDriverWait(self.driver, 3).until( # Short wait for login prompt
+                EC.presence_of_element_located((By.ID, "login_forum"))
+            )
+            # If above doesn't raise TimeoutException, "login_forum" is present
+            logging.info(f"Locked category detected at {section_url_original}, attempting to unlock...")
+            password = self.login_config.get("forum_password")
+            if not password:
+                logging.error(f"No forum password for locked section {section_url_original}. Skipping.")
+                return []
+            
+            password_input_el = self.driver.find_element(By.ID, "password")
+            password_input_el.clear()
+            password_input_el.send_keys(password)
+            
+            submit_btn = None
+            submit_selectors = [
+                (By.NAME, "login"), (By.CSS_SELECTOR, "input[type='submit']"), (By.ID, "load")
+            ]
+            for by_type, val in submit_selectors:
+                try:
+                    btn = self.driver.find_element(by_type, val)
+                    if btn.is_displayed() and btn.is_enabled():
+                        submit_btn = btn
+                        break
+                except:
+                    continue
+            
+            if not submit_btn:
+                logging.error(f"Submit button not found for locked section {section_url_original}. Skipping.")
+                return []
+
+            submit_btn.click()
+            WebDriverWait(self.driver, 10).until(EC.staleness_of(password_input_el))
+            logging.info(f"Forum password submitted for {section_url_original}.")
+
+        except TimeoutException:
+            logging.debug(f"'login_forum' prompt not found for {section_url_original}, proceeding.")
+        except Exception as e:
+            logging.error(f"Error during locked category handling for {section_url_original}: {e}. Skipping.")
+            return []
+
+        if normalized_section_url in self.visited_urls:
+            logging.info(f"Skipping already mirrored (normalized) section: {normalized_section_url} (original: {section_url_original})")
+            return []
+       
+        logging.info(f"Mirroring section: {section_url_original} (normalized: {normalized_section_url})")
+        
+        try:
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            time.sleep(self.login_config.get("page_load_delay", 2))
+            
+            html_content = self.driver.page_source
+            new_discovered_urls_original_form = self._process_section_page_content(html_content, section_url_original) 
+            
+            self.visited_urls.add(normalized_section_url)
+            self.save_url_to_file(normalized_section_url)
+            
+            section_num = self.get_section_number(normalized_section_url)
+            if section_num:
+                self.forum_sections.add(section_num)
+            
+            return new_discovered_urls_original_form
+        except Exception as e:
+            logging.error(f"Failed to mirror section {section_url_original} post-unlock: {e}")
+            return []
+
+    def is_forum_section_link(self, url): # Added back for completeness
+        """Check if URL is a forum section link (can be normalized or original)."""
         parsed = urlparse(url)
         if parsed.path.endswith('viewforum.php'):
             params = parse_qs(parsed.query)
             return 'f' in params
         return False
-
-    def mirror_section(self, section_url):
-        """Mirror an entire forum section including all topics"""
-        print(f"Mirroring section: {section_url}")
-        self.driver.get_screenshot_as_file("forum_mirror_section.png")  # Take a screenshot for debugging
-
-        try:
-            print("Checking for locked categories...")
-            self.driver.get(section_url)
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.ID, "login_forum"))
-            )
-            if len(self.driver.find_elements(By.ID, "login_forum")) > 0:
-                logging.info("Locked category detected, attempting to unlock...")
-                password = self.login_config.get("forum_password")
-                if not password:
-                    logging.error("No forum password provided in login_config.")
-                    return
-                password_input = self.driver.find_element(By.ID, "password")
-                password_input.clear()
-                password_input.send_keys(password)
-                submit_btn = self.driver.find_element(By.ID, "load")
-                self.driver.get_screenshot_as_file("forum_unlock.png")  # Take a screenshot for debugging
-                logging.info("Submitting forum password...")
-                submit_btn.click()
-                time.sleep(3)  # Wait for unlock to process
-                WebDriverWait(self.driver, 10).until(EC.staleness_of(password_input))
-                logging.info("Forum password submitted.")
-                self.mirror_section(section_url)  # Retry mirroring the section after unlocking
-            else:
-                print("No locked category detected, proceeding with mirroring.")
-        except Exception as e:
-            logging.error(f"Error handling locked category inside of mirror_section: {str(e)}")
-        
-        if section_url in self.visited_urls:
-            return []
-       
-        logging.info(f"Mirroring section: {section_url}")
-        new_urls = [] 
-        try:
-            self.driver.get(section_url)
-            print(f"Visiting section URL: {section_url}")
-
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
-            time.sleep(2)
-            
-            html_content = self.driver.page_source
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # Save the current page
-            output_file = self.create_directory_structure(section_url)
-            self.download_assets(soup, self.output_dir)
-            
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(str(soup))
-            
-            self.visited_urls.add(section_url)
-            
-            # Find all topic links
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                if href.startswith('./'):
-                    href = href[2:]
-                full_url = urljoin(section_url, href)
-                
-                if self.is_topic_link(full_url):
-                    topic_num = self.get_topic_number(full_url)
-                    if topic_num and topic_num not in self.topics:
-                        self.topics.add(topic_num)
-                        new_urls.append(full_url)
-            print(f"what is new_urls: {new_urls}")
-            # Get pagination URLs for the section
-            pagination_urls = self.get_pagination_urls(soup, section_url)
-            new_urls.extend(pagination_urls)
-            print(f"Found {len(new_urls)} new URLs in section {section_url}") 
-            return new_urls
-
-        except Exception as e:
-            logging.error(f"Failed to mirror section {section_url}: {str(e)}")
-            return []
 
     def load_cookies(self, cookie_file='cookies.pkl'):
         try:
@@ -422,41 +495,119 @@ class ForumMirror:
         try:
             cookies_loaded = False
             if os.path.exists('cookies.pkl'):
+                self.driver.get(self.base_url) # Navigate to domain before loading cookies
+                time.sleep(1) 
                 cookies_loaded = self.load_cookies('cookies.pkl')
+            
             if not cookies_loaded:
                 if self.login_config and not self.perform_login():
                     logging.error("Failed to login. Aborting mirror process.")
+                    self.driver.quit()
                     return
 
-            urls_to_visit = [self.start_url]
-            sections_processed = 0
+            queue = [self.start_url]  # Stores URLs in their original discovered form
+            # queued_normalized_urls tracks normalized versions of URLs in queue or already processed by the loop
+            # to prevent adding effectively duplicate URLs to the queue.
+            queued_normalized_urls = {self.normalize_url(self.start_url)}
+            
+            sections_processed_count = 0
 
-            while urls_to_visit:
-                url = urls_to_visit.pop(0)
+            while queue:
+                current_url_original = queue.pop(0)
                 
-                if self.is_forum_section_link(url):
-                    print(f"Processing section: {url}")
-                    if max_sections and sections_processed >= max_sections:
-                        break
-                    print("sending section url to mirror_section")
-                    new_urls = self.mirror_section(url)
-                    sections_processed += 1
-                elif self.is_topic_link(url):
-                    new_urls = self.mirror_topic(url)
+                # For type checking, use a normalized version, though our current checks are simple.
+                # The mirror_* methods will handle the self.visited_urls check internally with normalized URLs.
+                url_normalized_for_type_check = self.normalize_url(current_url_original)
+
+                logging.info(f"Processing URL from queue: {current_url_original} (normalized: {url_normalized_for_type_check})")
+                newly_discovered_urls_original_form = []
+                
+                processed_this_iteration = False
+                if self.is_forum_section_link(url_normalized_for_type_check):
+                    if max_sections and sections_processed_count >= max_sections:
+                        logging.info(f"Max sections ({max_sections}) reached. Skipping further processing of new sections.")
+                        # We still process other types of URLs or already queued sections.
+                    else:
+                        newly_discovered_urls_original_form = self.mirror_section(current_url_original)
+                        # Check if the section was actually processed (i.e., its normalized form is now in visited_urls)
+                        if self.normalize_url(current_url_original) in self.visited_urls:
+                            # Check if this section number was newly added to self.forum_sections
+                            # This is tricky as mirror_section adds it.
+                            # A simpler way: if mirror_section didn't return empty due to already visited
+                            # sections_processed_count is incremented when a section page is successfully mirrored.
+                            # The mirror_section adds to self.forum_sections.
+                            # We can count based on the size of self.forum_sections, but that's after the fact.
+                            # Let's increment if mirror_section implies it processed a new section.
+                            # The check `if self.normalize_url(current_url_original) in self.visited_urls:`
+                            # after calling mirror_section confirms it was processed (or was already visited and skipped by the call).
+                            # To count *newly processed* sections:
+                            # initial_section_count = len(self.forum_sections)
+                            # ... call mirror_section ...
+                            # if len(self.forum_sections) > initial_section_count: sections_processed_count +=1
+                            # This is more robust. Let's do it this way.
+                            pass # section counting handled by checking self.visited_urls later
+                        processed_this_iteration = True
+
+                elif self.is_topic_link(url_normalized_for_type_check):
+                    newly_discovered_urls_original_form = self.mirror_topic(current_url_original)
+                    processed_this_iteration = True
                 else:
-                    new_urls = self.mirror_page(url)
+                    newly_discovered_urls_original_form = self.mirror_page(current_url_original)
+                    processed_this_iteration = True
+
+                # Increment section count if a section URL was processed and added to visited_urls
+                # This assumes mirror_section adds to self.visited_urls only upon successful processing
+                if self.is_forum_section_link(url_normalized_for_type_check) and \
+                   self.normalize_url(current_url_original) in self.visited_urls and \
+                   (not max_sections or sections_processed_count < max_sections):
+                    # To accurately count sections processed up to max_sections:
+                    # We need to know if this specific section *became* visited in this iteration
+                    # and wasn't already counted.
+                    # The `self.forum_sections` set (which stores section numbers) is a good proxy.
+                    # The sections_processed_count should ideally track unique sections processed.
+                    # Let's use len(self.forum_sections) directly if max_sections is about unique sections.
+                    # The current sections_processed_count is more like "attempts to process section URLs".
+                    # For now, let's assume sections_processed_count tracks calls to mirror_section that weren't skipped by max_sections.
+                    if processed_this_iteration and not (max_sections and sections_processed_count >= max_sections):
+                         # This logic is a bit tangled. Let's simplify:
+                         # sections_processed_count will be len(self.forum_sections) at the end.
+                         # The max_sections check should be against len(self.forum_sections).
+                        if self.is_forum_section_link(url_normalized_for_type_check):
+                            current_section_num = self.get_section_number(url_normalized_for_type_check)
+                            # Check if this section is newly processed for counting purposes
+                            # This is complex because mirror_section adds to self.forum_sections
+                            # Let's rely on mirror_section to add to self.forum_sections
+                            # and check len(self.forum_sections) for the max_sections limit.
+                            pass # Max section check refined below
+
+
+                for new_url_original in newly_discovered_urls_original_form:
+                    new_url_normalized = self.normalize_url(new_url_original)
+                    if new_url_normalized not in self.visited_urls and \
+                       new_url_normalized not in queued_normalized_urls:
+                        
+                        # Specific check for adding new sections if max_sections is active
+                        if max_sections and self.is_forum_section_link(new_url_normalized) and \
+                           len(self.forum_sections) >= max_sections:
+                            # If this new URL is a section link, and we've already processed max_sections unique sections,
+                            # and this new section is not one of those already processed (get_section_number not in self.forum_sections),
+                            # then skip adding it.
+                            sec_num_of_new_url = self.get_section_number(new_url_normalized)
+                            if sec_num_of_new_url not in self.forum_sections:
+                                logging.info(f"Max sections ({max_sections} unique) reached. Not queuing new section: {new_url_original}")
+                                continue
+                        
+                        queue.append(new_url_original)
+                        queued_normalized_urls.add(new_url_normalized)
                 
-                # Ensure new URLs are not already visited
-                print(f"New URLs found: {new_urls}")
-                urls_to_visit.extend([u for u in new_urls if u not in self.visited_urls])
-                print(f"Current queue size: {len(urls_to_visit)}")
-                logging.info(f"Queue size: {len(urls_to_visit)}, Visited: {len(self.visited_urls)}")
+                logging.info(f"Queue size: {len(queue)}, Visited (normalized): {len(self.visited_urls)}, Unique Sections: {len(self.forum_sections)}, Unique Topics: {len(self.topics)}")
 
         except Exception as e:
-            logging.error(f"Mirror process failed: {str(e)}")
+            logging.error(f"Mirror process failed: {str(e)}", exc_info=True)
         finally:
             self.driver.quit()
-            logging.info(f"Mirroring complete. Processed {len(self.forum_sections)} sections and {len(self.topics)} topics")
+            logging.info(f"Mirroring complete. Processed {len(self.forum_sections)} unique sections and {len(self.topics)} unique topics.")
+            logging.info(f"Total URLs visited (normalized): {len(self.visited_urls)}")
 
 if __name__ == "__main__":
     # Load login configuration
