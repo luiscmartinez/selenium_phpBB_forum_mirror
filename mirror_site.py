@@ -93,13 +93,6 @@ class ForumMirror:
             print("Login failed!")
             return False
 
-    def is_forum_section_link(self, url):
-        """Check if URL is a forum section link"""
-        parsed = urlparse(url)
-        if parsed.path.endswith('viewforum.php'):
-            params = parse_qs(parsed.query)
-            return 'f' in params
-        return False
 
     def get_section_number(self, url):
         """Extract forum section number from URL"""
@@ -180,7 +173,7 @@ class ForumMirror:
                     
                     img['src'] = f'../../{img_path}'
                 except Exception as e:
-                    logging.error(f"Failed to download image {img_url}: {str(e)}")
+                    logging.error(f"Failed to download image {img_url}")
 
         # Handle CSS
         for css in soup.find_all('link', rel='stylesheet'):
@@ -198,7 +191,7 @@ class ForumMirror:
                     
                     css['href'] = f'../../{css_path}'
                 except Exception as e:
-                    logging.error(f"Failed to download CSS {css_url}: {str(e)}")
+                    logging.error(f"Failed to download CSS {css_url}")
 
     def mirror_page(self, url):
         if url in self.visited_urls:
@@ -330,14 +323,46 @@ class ForumMirror:
 
     def mirror_section(self, section_url):
         """Mirror an entire forum section including all topics"""
-        if section_url in self.visited_urls:
-            return []
-
-        logging.info(f"Mirroring section: {section_url}")
-        new_urls = []
+        print(f"Mirroring section: {section_url}")
+        self.driver.get_screenshot_as_file("forum_mirror_section.png")  # Take a screenshot for debugging
 
         try:
+            print("Checking for locked categories...")
             self.driver.get(section_url)
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.ID, "login_forum"))
+            )
+            if len(self.driver.find_elements(By.ID, "login_forum")) > 0:
+                logging.info("Locked category detected, attempting to unlock...")
+                password = self.login_config.get("forum_password")
+                if not password:
+                    logging.error("No forum password provided in login_config.")
+                    return
+                password_input = self.driver.find_element(By.ID, "password")
+                password_input.clear()
+                password_input.send_keys(password)
+                submit_btn = self.driver.find_element(By.ID, "load")
+                self.driver.get_screenshot_as_file("forum_unlock.png")  # Take a screenshot for debugging
+                logging.info("Submitting forum password...")
+                submit_btn.click()
+                time.sleep(3)  # Wait for unlock to process
+                WebDriverWait(self.driver, 10).until(EC.staleness_of(password_input))
+                logging.info("Forum password submitted.")
+                self.mirror_section(section_url)  # Retry mirroring the section after unlocking
+            else:
+                print("No locked category detected, proceeding with mirroring.")
+        except Exception as e:
+            logging.error(f"Error handling locked category inside of mirror_section: {str(e)}")
+        
+        if section_url in self.visited_urls:
+            return []
+       
+        logging.info(f"Mirroring section: {section_url}")
+        new_urls = [] 
+        try:
+            self.driver.get(section_url)
+            print(f"Visiting section URL: {section_url}")
+
             WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
@@ -367,18 +392,17 @@ class ForumMirror:
                     if topic_num and topic_num not in self.topics:
                         self.topics.add(topic_num)
                         new_urls.append(full_url)
-            
+            print(f"what is new_urls: {new_urls}")
             # Get pagination URLs for the section
             pagination_urls = self.get_pagination_urls(soup, section_url)
             new_urls.extend(pagination_urls)
-            
+            print(f"Found {len(new_urls)} new URLs in section {section_url}") 
             return new_urls
 
         except Exception as e:
             logging.error(f"Failed to mirror section {section_url}: {str(e)}")
             return []
 
-    def mirror_forum(self, max_sections=None):
     def load_cookies(self, cookie_file='cookies.pkl'):
         try:
             with open(cookie_file, 'rb') as f:
@@ -404,9 +428,6 @@ class ForumMirror:
                     logging.error("Failed to login. Aborting mirror process.")
                     return
 
-            self.driver.get_screenshot_as_file("forum_unlock2.png")  # Take a screenshot for debugging
-            # Check for locked category after login
-
             urls_to_visit = [self.start_url]
             sections_processed = 0
 
@@ -426,7 +447,9 @@ class ForumMirror:
                     new_urls = self.mirror_page(url)
                 
                 # Ensure new URLs are not already visited
+                print(f"New URLs found: {new_urls}")
                 urls_to_visit.extend([u for u in new_urls if u not in self.visited_urls])
+                print(f"Current queue size: {len(urls_to_visit)}")
                 logging.info(f"Queue size: {len(urls_to_visit)}, Visited: {len(self.visited_urls)}")
 
         except Exception as e:
@@ -440,7 +463,6 @@ if __name__ == "__main__":
     with open('login_config.json', 'r') as f:
         login_config = json.load(f)
 
-    base_url = login_config['base_url'] 
     base_url = login_config['base_url']
     output_directory = "mirrored_forum"
     
